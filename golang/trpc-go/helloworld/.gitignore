@@ -1,0 +1,8 @@
+/.idea/
+cover.*
+helloworld.test
+http_client
+main.test
+pprof*
+profile*
+trpc.log

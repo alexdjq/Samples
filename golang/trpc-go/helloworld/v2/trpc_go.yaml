@@ -1,0 +1,59 @@
+global:                            # global config.
+  namespace: Development           # environment type, two types: production and development.
+server:                                         # server configuration.
+  app: test                                     # business application name.
+  server: helloworld                            # service process name.
+  bin_path: /usr/local/trpc/bin/                # paths to binary executables and framework configuration files.
+  conf_path: /usr/local/trpc/conf/              # paths to business configuration files.
+  data_path: /usr/local/trpc/data               # paths to business data files.
+  #filter:
+  #  - recovery
+  service:                                   # business service configuration，can have multiple.
+    - callee: trpc.alexduTest.helloworld.Greeter           # the route name of the service.
+      name: trpc.alexduTest.helloworld.Greeter           # the route name of the service.
+      ip: 9.134.33.106                          # the service listening ip address, can use the placeholder ${ip}, choose one of ip and nic, priority ip.
+      nic: eth1                              # the service listening network card address, if configures ip, you don't need to configure it.
+      port: 10002                             # the service listening port, can use the placeholder ${port}.
+      network: tcp                           # the service listening network type,  tcp or udp.
+      protocol: trpc                         # application layer protocol, trpc or http.
+      timeout: 1000                          # maximum request processing time in milliseconds.
+      idletime: 300000                       # connection idle time in milliseconds.
+      registry: polaris                      # The service registration method used when the service starts.      
+                    
+client:                                      # configuration for client calls.
+  timeout: 1000                              # maximum request processing time for all backends.
+  namespace: Development  # 针对所有后端的环境
+  service:                                   # configuration for a single backend.
+    - name: trpc.alexduTest.helloworld.Greeter           # backend service name.
+      namespace: Development                 # backend service environment.
+      network: tcp                           # backend service network type, tcp or udp, configuration takes precedence.
+      protocol: trpc                         # application layer protocol, trpc or http.
+      timeout: 800                          # maximum request processing time in milliseconds.     
+  
+  
+plugins:                                     # plugin configuration.
+  log:                                       # Multiple logs can be logged using log.get ("xxx").Debug
+    default:                                 # default log configuration. Each log can support multiple outputs.
+      - writer: console                      # console standard output
+        level: debug                         # log level.  
+  
+  registry:                                          #针对trpc框架服务注册的配置
+      polaris:                                         #北极星服务注册的配置
+        heartbeat_interval: 3000                       #心跳上报间隔（毫秒）
+        protocol: grpc                                 #名字服务远程交互协议类型
+        register_self: true                            #是否自注册
+        service:
+          - name: trpc.alexduTest.helloworld.Greeter   #北极星上的服务名
+            namespace: Development                     #命名空间
+            token: 0dc9e1214c3642cf9d34afa896ca01d0    #服务Token
+            metadata:                    # ← 在这里添加 metadata
+              grey_version: "v2" 
+
+  selector:                                          #针对trpc框架服务发现的配置
+      polaris:                                         #北极星服务发现的配置
+        #debug: true                                    #开启 debug 日志
+        #log_dir: $HOME/polaris/log                    #北极星日志目录
+        protocol: grpc                                 #名字服务远程交互协议类型
+        #loadbalance:
+        #  name:
+        #    - polaris_dwr # dynamicWeightedRandom

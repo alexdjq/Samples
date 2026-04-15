@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package trpc.alexduTest.helloworld;
+option go_package = "git.code.oa.com/trpcprotocol/test/helloworld";
+
+// data validation (for local)
+import "validate.proto";
+// data validation (for "rick" platform)
+//import "trpc/common/validate.proto";
+
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+}
+
+message HelloRequest {
+  // The length of the msg field must be greater than 1.
+  string msg = 1 [(validate.rules).string.min_len = 1];
+  // Or, no data validation.
+  // string msg = 1;
+}
+
+message HelloReply {
+  string msg = 1;
+}

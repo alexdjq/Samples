@@ -1,0 +1,33 @@
+2026-04-15 14:35:34.748937Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 14:35:34.754718Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 14:40:58.250953Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 14:40:58.300857Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 14:45:06.400396Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 14:50:47.075955Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 14:50:55.580762Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 14:53:41.941033Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 14:55:42.281681Z	info	detect	errorcount/err_count.go:178	closeToOpen errorCount: instance(id=b1e4f909fab11d9f4fe87071c38e87592e7ae8a9, address=11.154.192.128:8081) match condition for failCount=1(threshold=1)
+2026-04-15 14:55:42.281804Z	info	detect	errorcount/err_count.go:178	closeToOpen errorCount: instance(id=b1e4f909fab11d9f4fe87071c38e87592e7ae8a9, address=11.154.192.128:8081) match condition for failCount=1(threshold=1)
+2026-04-15 14:55:42.281813Z	warn	detect	circuitbreaker/circuitbreaker.go:68	errorCount circuitbreaker: close to open, instance: Id: b1e4f909fab11d9f4fe87071c38e87592e7ae8a9, Namespace: Polaris, Service: polaris.dynamic.weight, Host: 11.154.192.128, Port: 8081
+2026-04-15 14:55:42.281858Z	info	detect	cbcheck/realtime.go:79	success to realtime circuitBreak check for {namespace: "Polaris", service: "polaris.dynamic.weight"}, result is {Service: polaris.dynamic.weight, Namespace: Polaris, Properties: {ID: b1e4f909fab11d9f4fe87071c38e87592e7ae8a9, Properties: CircuitBreakerStatus:{circuitBreaker:errorCount, status:1, startTime:2026-04-15 14:55:42.281600144 +0800 CST m=+7.029194833}}}
+2026-04-15 14:56:20.280433Z	info	detect	errorcount/err_count.go:178	closeToOpen errorCount: instance(id=d0fb2a3269e2ccdb8cf045e6a189fe24a3ed8f88, address=11.181.41.204:8081) match condition for failCount=1(threshold=1)
+2026-04-15 14:56:20.280540Z	info	detect	errorcount/err_count.go:178	closeToOpen errorCount: instance(id=d0fb2a3269e2ccdb8cf045e6a189fe24a3ed8f88, address=11.181.41.204:8081) match condition for failCount=1(threshold=1)
+2026-04-15 14:56:20.280550Z	warn	detect	circuitbreaker/circuitbreaker.go:68	errorCount circuitbreaker: close to open, instance: Id: d0fb2a3269e2ccdb8cf045e6a189fe24a3ed8f88, Namespace: Polaris, Service: polaris.dynamic.weight, Host: 11.181.41.204, Port: 8081
+2026-04-15 14:56:20.280599Z	info	detect	cbcheck/realtime.go:79	success to realtime circuitBreak check for {namespace: "Polaris", service: "polaris.dynamic.weight"}, result is {Service: polaris.dynamic.weight, Namespace: Polaris, Properties: {ID: d0fb2a3269e2ccdb8cf045e6a189fe24a3ed8f88, Properties: CircuitBreakerStatus:{circuitBreaker:errorCount, status:1, startTime:2026-04-15 14:56:20.271836214 +0800 CST m=+45.019430924}}}
+2026-04-15 14:56:37.279168Z	info	detect	circuitbreaker/circuitbreaker.go:76	errorCount circuitbreaker: open to halfopen, instance: Id: b1e4f909fab11d9f4fe87071c38e87592e7ae8a9, Namespace: Polaris, Service: polaris.dynamic.weight, Host: 11.154.192.128, Port: 8081
+2026-04-15 14:57:07.279349Z	info	detect	circuitbreaker/circuitbreaker.go:92	errorCount circuitbreaker: halfopen to close, instance: Id: b1e4f909fab11d9f4fe87071c38e87592e7ae8a9, Namespace: Polaris, Service: polaris.dynamic.weight, Host: 11.154.192.128, Port: 8081
+2026-04-15 14:57:07.279407Z	info	detect	circuitbreaker/circuitbreaker.go:76	errorCount circuitbreaker: open to halfopen, instance: Id: d0fb2a3269e2ccdb8cf045e6a189fe24a3ed8f88, Namespace: Polaris, Service: polaris.dynamic.weight, Host: 11.181.41.204, Port: 8081
+2026-04-15 14:59:56.052082Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 15:13:20.708499Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 15:13:20.749005Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 15:21:55.055758Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 15:28:35.622689Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 15:28:35.667395Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
+2026-04-15 15:28:36.668297Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.monitor"}
+2026-04-15 15:39:16.213573Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 15:44:28.226067Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 15:48:03.421310Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 16:00:25.987532Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 16:06:37.057941Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 16:10:56.814448Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Development", service: "trpc.alexduTest.helloworld.Greeter"}
+2026-04-15 16:27:56.229356Z	info	detect	cbcheck/ticker.go:92	instances not initialized for {namespace: "Polaris", service: "polaris.discover"}
