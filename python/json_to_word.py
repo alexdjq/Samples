@@ -61,8 +61,8 @@ _TABLE_USABLE_H_CM = _USABLE_H_CM - _TABLE_SAFETY_CM     # 26.9 cm
 CELL_W_CM = _USABLE_W_CM       / TABLE_COLS   # ~0.792 cm  (one Chinese char wide)
 CELL_H_CM = _TABLE_USABLE_H_CM / TABLE_ROWS   # ~5.38 cm
 
-FONT_SIZE_MAX_PT = 10.0
-FONT_SIZE_MIN_PT = 5.0
+FONT_SIZE_MAX_PT = 12.0
+FONT_SIZE_MIN_PT = 7.0
 FONT_SIZE_STEP   = 0.5
 
 
@@ -411,6 +411,7 @@ def set_cell_text(cell, text: str, bold: bool = False,
 
     columns = text.split("\n") if text else [""]
     first = True
+    last_para = None  # last paragraph that received real content
 
     def _new_para():
         nonlocal first
@@ -420,6 +421,7 @@ def set_cell_text(cell, text: str, bold: bool = False,
         return cell.add_paragraph()
 
     def _emit_token(token: str) -> None:
+        nonlocal last_para
         p = _new_para()
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after  = Pt(0)
@@ -449,13 +451,33 @@ def set_cell_text(cell, text: str, bold: bool = False,
         run.font.name = "SimSun"
         run.bold = bold
         _set_run_chinese_font(run, "SimSun")
+        last_para = p
 
-    for col_idx, col_text in enumerate(columns):
-        if col_idx > 0:
-            # Empty paragraph acts as a small vertical gap between
-            # adjacent person-columns inside the same cell.
+    # First pass: walk columns and convert *runs of empty columns* into
+    # an explicit ``space_after`` (in points) that we attach to the
+    # previous non-empty paragraph.  Using a real, measurable point
+    # value is far more reliable than relying on empty paragraphs
+    # whose height Word tends to collapse.
+    pending_gap_units = 0  # number of empty columns waiting to be flushed
+
+    def _flush_gap() -> None:
+        """Apply the accumulated gap (in units of one CJK glyph
+        height) to ``last_para``'s ``space_after``.  If there is no
+        previous content paragraph yet, emit a single blank-height
+        paragraph so the gap sits at the very top of the cell."""
+        nonlocal pending_gap_units, last_para
+        if pending_gap_units <= 0:
+            return
+        gap_pt = pending_gap_units * font_size
+        if last_para is not None:
+            existing = last_para.paragraph_format.space_after
+            base = existing.pt if existing is not None else 0
+            last_para.paragraph_format.space_after = Pt(base + gap_pt)
+        else:
+            # Gap appears before any real content: emit a spacer
+            # paragraph with the requested height as space_before.
             p = _new_para()
-            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_before = Pt(gap_pt)
             p.paragraph_format.space_after  = Pt(0)
             p.paragraph_format.line_spacing = 1.0
             if center:
@@ -464,9 +486,30 @@ def set_cell_text(cell, text: str, bold: bool = False,
             run.font.size = Pt(font_size)
             run.font.name = "SimSun"
             _set_run_chinese_font(run, "SimSun")
+        pending_gap_units = 0
+
+    for col_idx, col_text in enumerate(columns):
+        if col_text == "":
+            # Each empty column contributes one CJK-glyph-height gap.
+            pending_gap_units += 1
+            continue
+
+        # For two adjacent NON-empty columns (no empty columns between
+        # them), keep the legacy 1-glyph separator gap so existing
+        # multi-person cells still look the same.
+        if (col_idx > 0
+                and columns[col_idx - 1] != ""
+                and pending_gap_units == 0):
+            pending_gap_units = 1
+
+        _flush_gap()
 
         for token in _tokenize_for_vertical(col_text):
             _emit_token(token)
+
+    # If the text ended with empty columns, flush the trailing gap so
+    # it still produces visible whitespace at the bottom of the cell.
+    _flush_gap()
 
     # When ``center`` is requested, vertically center the whole
     # paragraph stack inside the tall cell (used by the rightmost
@@ -642,14 +685,21 @@ def _apply_table_border_style(table, header_col: int) -> None:
                 left = "single"
             if c == n_cols - 1:
                 right = "single"
-            # The single internal vertical separator: between the
-            # generation-label column and the person column to its
-            # left.
+            # Internal vertical separators we want to keep:
+            #   1. Between the generation-label column and the person
+            #      column to its left (left edge of ``header_col``).
+            #   2. Between the generation-label column and the
+            #      rightmost book-title/page column to its right
+            #      (right edge of ``header_col``).
+            # All other internal vertical lines stay hidden.
             if 0 <= header_col < n_cols:
                 if c == header_col:
                     left = "single"
+                    right = "single"
                 if c == header_col - 1:
                     right = "single"
+                if c == header_col + 1:
+                    left = "single"
             _set_cell_borders(cell, top=top, bottom=bottom,
                               left=left, right=right)
 
@@ -741,11 +791,87 @@ def _cluster_x_anchors(
     return anchors
 
 
+# ---------------------------------------------------------------------------
+# Page title / page-number extraction
+# ---------------------------------------------------------------------------
+
+_CN_DIGIT_CHARS = set("〇○零一二三四五六七八九十百千两")
+# Characters that strongly identify a multi-digit page number (e.g. the
+# 0 in "三〇八").  A bare generation index such as "十八" never contains
+# any of these, so requiring at least one of them lets us tell page
+# numbers apart from generation labels that lost their trailing "世".
+_CN_PAGE_REQUIRED_CHARS = set("〇○零百千")
+
+
+def _is_cn_page_number(text: str) -> bool:
+    """Return True if ``text`` looks like a Chinese-numeral page number.
+
+    Page numbers in this document are written vertically as Chinese
+    digits, e.g. "三〇八".  To avoid misclassifying a generation
+    index such as "十八" (a truncated "十八世") we require:
+      * length 2-5, all CJK digit / counter glyphs;
+      * AND at least one "page-only" glyph (〇 / ○ / 零 / 百 / 千).
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if not (2 <= len(t) <= 5):
+        return False
+    if not all(ch in _CN_DIGIT_CHARS for ch in t):
+        return False
+    return any(ch in _CN_PAGE_REQUIRED_CHARS for ch in t)
+
+
+def _extract_title_and_page(
+    parsing_results: List[Dict[str, Any]]
+) -> Tuple[str, str]:
+    """Extract "渑池" / "杜氏宗谱" title fragments and the page number.
+
+    Both of these live OUTSIDE the table's cell grid (they belong to the
+    page header / footer of the original PDF), so they are NOT included
+    in the per-cell OCR fragments we use to fill the table.  We therefore
+    pull them out of ``overall_ocr_res.rec_texts`` directly and return:
+
+        (title_text, page_text)
+
+    where ``title_text`` is the non-empty join of the title fragments
+    separated by ``\n`` (so the caller can render each as its own
+    person-column), and ``page_text`` is the page number string (or an
+    empty string if not found).
+    """
+    title_parts: List[str] = []
+    page_text = ""
+    seen: set = set()
+    for page in parsing_results:
+        pruned = page.get("prunedResult", page)
+        overall = pruned.get("overall_ocr_res", {})
+        for txt in overall.get("rec_texts", []):
+            if not txt:
+                continue
+            t = txt.strip()
+            if not t or t in seen:
+                continue
+            # Title fragments — match the originals ("渑池", "杜氏宗谱").
+            if t in ("渑池", "杜氏宗谱"):
+                title_parts.append(t)
+                seen.add(t)
+                continue
+            # Page number: prefer the first CN-digit-only fragment found.
+            if not page_text and _is_cn_page_number(t):
+                page_text = t
+                seen.add(t)
+    # Preserve the natural "渑池" before "杜氏宗谱" order if both were found.
+    title_parts.sort(key=lambda s: 0 if s == "渑池" else 1)
+    return "\n".join(title_parts), page_text
+
+
 def render_table(
     doc: Document,
     cell_box_list: List[Box],
     t_texts: List[str],
     t_boxes: List[Box],
+    title_text: str = "",
+    page_text: str = "",
 ) -> bool:
     """Render one detected table to ``doc``.
 
@@ -884,26 +1010,98 @@ def render_table(
                     cell_text[w_row][col] = text
 
         # 5. Render into the canonical fixed TABLE_ROWS x TABLE_COLS
-        #    table.  Source data is right-aligned to mirror the original
-        #    document layout: the rightmost column always holds the
-        #    generation label, and person columns extend leftward from
-        #    there.  Cells beyond the source data are left empty.
+        #    table.
+        #
+        #    Layout (right -> left):
+        #      * column TABLE_COLS-1 (rightmost): book title "渑池 / 杜氏
+        #        宗谱" on the first row + page number "三〇八" on the
+        #        last row, mirroring the page-edge column of the
+        #        original document.
+        #      * column TABLE_COLS-2 : generation labels (十六世 ...).
+        #      * columns 0 .. TABLE_COLS-3 : person columns, right-
+        #        aligned to the generation column.
+        #    When the title column is not requested (no extracted text),
+        #    we fall back to the previous behaviour where the generation
+        #    label sits in the rightmost column.
         word_table = _create_fixed_table(doc)
-        right_col_offset = TABLE_COLS - word_cols  # may be negative
+
+        has_title_col = bool(title_text or page_text)
+        title_col_idx = TABLE_COLS - 1 if has_title_col else -1
+        # Anchor for the generation-label column.
+        gen_label_col = TABLE_COLS - 2 if has_title_col else TABLE_COLS - 1
+        # Person columns occupy [0 .. gen_label_col-1]; right-align.
+        right_col_offset = gen_label_col - (word_cols - 1)
+
+        # Re-apply borders to match the new header column position so
+        # the only internal vertical line stays adjacent to the
+        # generation-label column.
+        _apply_table_border_style(word_table, header_col=gen_label_col)
+
+        # If the title column is enabled, vertically merge all 5 rows
+        # of the rightmost column into a single tall cell.  The merged
+        # cell holds "渑池 / 杜氏宗谱" near the top and the page number
+        # near the bottom, with both vertically centered together so
+        # they read as a single page-edge label, just like in the
+        # source document.
+        if has_title_col:
+            top_cell = word_table.cell(0, title_col_idx)
+            for r_idx in range(1, TABLE_ROWS):
+                top_cell.merge(word_table.cell(r_idx, title_col_idx))
+
         for r_idx in range(TABLE_ROWS):
             for c_idx in range(TABLE_COLS):
+                if c_idx == title_col_idx:
+                    # The merged title/page cell is filled exactly
+                    # once below; skip the per-row iteration here.
+                    continue
+
                 txt = ""
                 bold_flag = False
+                center_flag = False
+
                 src_c = c_idx - right_col_offset
                 if 0 <= r_idx < word_rows and 0 <= src_c < word_cols:
                     txt = cell_text[r_idx][src_c]
                     bold_flag = (src_c == header_col)
+                if c_idx == gen_label_col:
+                    center_flag = True
+
                 set_cell_text(
                     word_table.cell(r_idx, c_idx),
                     txt,
                     bold=bold_flag,
-                    center=(c_idx == TABLE_COLS - 1),
+                    center=center_flag,
                 )
+
+        # Fill the merged title/page cell once, vertically centered
+        # within the full-height column.
+        #
+        # The title text returned by ``_extract_title_and_page`` is
+        # already ``"渑池\n杜氏宗谱"`` so each fragment occupies one
+        # person-column inside the merged cell.  We insert TWO empty
+        # person-columns (i.e. ``\n\n\n``) between every pair of
+        # logical labels so that, vertically, there is roughly a
+        # two-character gap between "渑池" and "杜氏宗谱" and between
+        # "杜氏宗谱" and the page number "三〇八", matching the
+        # spacing of the original document.
+        if has_title_col:
+            label_groups: List[str] = []
+            if title_text:
+                # Split the multi-fragment title into individual
+                # labels and insert two empty person-columns between
+                # consecutive labels.
+                title_labels = [s for s in title_text.split("\n") if s]
+                if title_labels:
+                    label_groups.append("\n\n\n".join(title_labels))
+            if page_text:
+                label_groups.append(page_text)
+            merged_text = "\n\n\n".join(label_groups)
+            set_cell_text(
+                word_table.cell(0, title_col_idx),
+                merged_text,
+                bold=True,
+                center=True,
+            )
         return True
 
     # ---- Fallback: generic grid rendered into the fixed 5x24 table -----
@@ -945,6 +1143,12 @@ def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
     # sits at the very top of the page.
     for p in list(doc.paragraphs):
         p._element.getparent().remove(p._element)
+
+    # Pull "渑池 / 杜氏宗谱" and the page number out of the global OCR
+    # results once.  These belong to the page edge in the source PDF
+    # and live outside the table's cell grid, so they would otherwise
+    # be dropped.
+    title_text, page_text = _extract_title_and_page(parsing_results)
 
     table_index = 0
     for page_idx, page in enumerate(parsing_results):
@@ -989,7 +1193,10 @@ def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
                         t_texts.append(txt)
                         t_boxes.append(bx)
 
-                if not render_table(doc, cell_box_list, t_texts, t_boxes):
+                if not render_table(
+                    doc, cell_box_list, t_texts, t_boxes,
+                    title_text=title_text, page_text=page_text,
+                ):
                     doc.add_paragraph(block.get("block_content", ""))
             # Non-table blocks are intentionally skipped: the user only
             # wants the genealogy table on the page.
