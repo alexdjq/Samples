@@ -23,7 +23,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 try:
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, Cm
     from docx.enum.table import WD_ALIGN_VERTICAL
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
@@ -31,6 +31,38 @@ except ImportError:
     print("Missing dependency 'python-docx'. Please install it via:")
     print("    pip install python-docx")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Page / table layout constants  (A4 page, fixed 5 rows x 24 columns)
+# ---------------------------------------------------------------------------
+
+A4_WIDTH_CM  = 21.0
+A4_HEIGHT_CM = 29.7
+
+MARGIN_TOP_CM    = 0.5
+MARGIN_BOTTOM_CM = 0.5
+MARGIN_LEFT_CM   = 1.0
+MARGIN_RIGHT_CM  = 1.0
+
+TABLE_ROWS = 5
+TABLE_COLS = 24
+
+_USABLE_W_CM = A4_WIDTH_CM  - MARGIN_LEFT_CM  - MARGIN_RIGHT_CM   # 19 cm
+_USABLE_H_CM = A4_HEIGHT_CM - MARGIN_TOP_CM   - MARGIN_BOTTOM_CM  # 27.7 cm
+
+# Reserve a tiny safety buffer (a few mm) below the table so Word
+# never spills the last row to a second page because of paragraph
+# baseline / line-spacing rounding.
+_TABLE_SAFETY_CM = 0.4
+_TABLE_USABLE_H_CM = _USABLE_H_CM - _TABLE_SAFETY_CM     # 26.9 cm
+
+CELL_W_CM = _USABLE_W_CM       / TABLE_COLS   # ~0.792 cm  (one Chinese char wide)
+CELL_H_CM = _TABLE_USABLE_H_CM / TABLE_ROWS   # ~5.38 cm
+
+FONT_SIZE_MAX_PT = 10.0
+FONT_SIZE_MIN_PT = 5.0
+FONT_SIZE_STEP   = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -222,23 +254,301 @@ def _set_run_chinese_font(run, font_name: str = "SimSun") -> None:
     rfonts.set(qn("w:eastAsia"), font_name)
 
 
-def set_cell_text(cell, text: str, bold: bool = False) -> None:
-    """Write ``text`` into a docx cell, preserving newlines as paragraphs."""
-    cell.text = ""
-    paragraphs = text.split("\n") if text else [""]
-    first = True
-    for line in paragraphs:
-        if first:
-            p = cell.paragraphs[0]
-            first = False
+def _clear_cell_text_direction(cell) -> None:
+    """Remove any text-direction setting on this cell.
+
+    The default left-to-right, top-to-bottom (lrTb) direction keeps all
+    characters upright, which is what we want when laying out Chinese
+    "vertical text" by putting one character per paragraph.  We never
+    set tbRl here because that would cause Word to rotate Chinese
+    glyphs in some font configurations.
+    """
+    tc = cell._tc
+    tcPr = tc.find(qn("w:tcPr"))
+    if tcPr is None:
+        return
+    td = tcPr.find(qn("w:textDirection"))
+    if td is not None:
+        tcPr.remove(td)
+
+
+def _count_glyphs(text: str) -> Tuple[int, int]:
+    """Return (max_segments_in_a_column, number_of_columns) for ``text``.
+
+    Each ``\n``-separated piece is treated as one column, and within a
+    column every character (Chinese, digit, etc.) counts as exactly one
+    segment because the cell is laid out as one paragraph per character.
+    """
+    if not text:
+        return 0, 0
+    columns = [c for c in text.split("\n") if c]
+    if not columns:
+        return 0, 0
+    max_segs = max(len(col) for col in columns)
+    return max_segs, len(columns)
+
+
+def _choose_font_size(text: str,
+                      cell_w_cm: float = CELL_W_CM,
+                      cell_h_cm: float = CELL_H_CM) -> float:
+    """Pick the largest font (pt) that lets ``text`` fit one cell.
+
+    Sizing model — must match :func:`set_cell_text`:
+      * The cell uses lrTb text direction.
+      * Each Chinese character occupies one paragraph (~ ``font_pt *
+        0.0353`` cm tall and ~one em wide).
+      * Each run of ASCII characters (a year, a range, ...) also
+        occupies one paragraph but is rendered with a smaller, fitted
+        font so that it always fits inside the cell width.  It still
+        consumes one paragraph of vertical space, sized like a
+        Chinese glyph.
+      * Adjacent visual columns inside the same cell are separated by
+        one empty paragraph.
+
+    We therefore only need to make sure the *total number of
+    paragraphs* fits inside the cell height, and that the cell width
+    can hold one Chinese glyph.
+    """
+    if not text:
+        return FONT_SIZE_MAX_PT
+
+    columns = [c for c in text.split("\n") if c]
+    if not columns:
+        return FONT_SIZE_MAX_PT
+
+    column_tokens = [_tokenize_for_vertical(c) for c in columns]
+    column_tokens = [toks for toks in column_tokens if toks]
+    if not column_tokens:
+        return FONT_SIZE_MAX_PT
+
+    total_paras = (
+        sum(len(toks) for toks in column_tokens)
+        + max(0, len(column_tokens) - 1)
+    )
+
+    inner_w = max(cell_w_cm - 0.05, 0.1)
+    inner_h = max(cell_h_cm - 0.05, 0.1)
+
+    size = FONT_SIZE_MAX_PT
+    while size > FONT_SIZE_MIN_PT:
+        em_cm = size * 0.0353
+        height_need = total_paras * em_cm
+        width_need  = em_cm  # one CJK glyph wide
+        if height_need <= inner_h and width_need <= inner_w:
+            break
+        size -= FONT_SIZE_STEP
+    return max(size, FONT_SIZE_MIN_PT)
+
+
+def _tokenize_for_vertical(text: str) -> List[str]:
+    """Split ``text`` into vertical-layout tokens.
+
+    Rules:
+      * Each Chinese character (or punctuation written in fullwidth /
+        CJK form) becomes its own token so that it stands alone on one
+        paragraph (visual vertical layout, glyph upright).
+      * Consecutive ASCII / halfwidth characters — digits, letters,
+        the Latin parentheses ``( )``, hyphen ``-``, dot ``.``, etc.
+        — are merged into a SINGLE token.  This token is rendered as
+        one horizontal paragraph, matching the original document where
+        a year like ``1990`` is written as four digits side-by-side
+        between vertical Chinese characters.
+
+    Whitespace is dropped because the cell is a tightly packed
+    vertical run of glyphs.
+    """
+    tokens: List[str] = []
+    buf: List[str] = []
+    for ch in text:
+        if ch.isspace():
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+            continue
+        # ASCII range (digits, letters, '(', ')', '-', '.', ',' etc.)
+        # is treated as horizontal text that stays glued together.
+        if ord(ch) < 128:
+            buf.append(ch)
         else:
-            p = cell.add_paragraph()
-        run = p.add_run(line)
-        run.font.size = Pt(10)
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+            tokens.append(ch)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def set_cell_text(cell, text: str, bold: bool = False,
+                  cell_w_cm: float = CELL_W_CM,
+                  cell_h_cm: float = CELL_H_CM) -> None:
+    """Render ``text`` inside a Word cell as upright vertical text.
+
+    Layout rules (matching the reference document):
+      * The cell uses the default (lrTb) text direction, so no glyph
+        is rotated.  Chinese characters and digits all stay upright.
+      * Each Chinese character is placed on its own paragraph, giving
+        the visual effect of vertical Chinese.
+      * Runs of ASCII characters (e.g. ``1990``, ``(1949-1995)``) are
+        kept together on a single horizontal paragraph so that, just
+        like in the reference document, the four digits of a year
+        share one row instead of being split into four rows.  An
+        ASCII run's font is shrunk so it fits in the single-glyph
+        cell width.
+      * ``\n`` in the source separates *visual columns* inside the
+        same cell (e.g. multiple persons).  An empty paragraph marks
+        the gap between adjacent columns.
+      * Font size is auto-shrunk **per cell** so that long content
+        only affects the offending cell, not its neighbours.
+    """
+    cell.text = ""
+    # Make sure no left-over vertical (tbRl) text direction is applied
+    # so that Chinese characters do NOT get rotated by Word.
+    _clear_cell_text_direction(cell)
+    font_size = _choose_font_size(text, cell_w_cm, cell_h_cm)
+
+    columns = text.split("\n") if text else [""]
+    first = True
+
+    def _new_para():
+        nonlocal first
+        if first:
+            first = False
+            return cell.paragraphs[0]
+        return cell.add_paragraph()
+
+    def _emit_token(token: str) -> None:
+        p = _new_para()
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after  = Pt(0)
+        p.paragraph_format.line_spacing = 1.0
+        run = p.add_run(token)
+        # ASCII-only tokens (e.g. years like 1990 or ranges like
+        # (1949-1995)) are rendered horizontally inside ONE paragraph.
+        # We shrink their font so the whole run fits in the
+        # single-glyph-wide cell, mimicking the reference document
+        # where year digits are noticeably smaller than the
+        # surrounding Chinese characters.
+        if token and all(ord(c) < 128 for c in token):
+            ascii_size = font_size * min(1.0, 1.0 / (0.55 * len(token)))
+            ascii_size = max(ascii_size, FONT_SIZE_MIN_PT * 0.7)
+            run.font.size = Pt(ascii_size)
+        else:
+            run.font.size = Pt(font_size)
         run.font.name = "SimSun"
         run.bold = bold
         _set_run_chinese_font(run, "SimSun")
+
+    for col_idx, col_text in enumerate(columns):
+        if col_idx > 0:
+            # Empty paragraph acts as a small vertical gap between
+            # adjacent person-columns inside the same cell.
+            p = _new_para()
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after  = Pt(0)
+            p.paragraph_format.line_spacing = 1.0
+            run = p.add_run("")
+            run.font.size = Pt(font_size)
+            run.font.name = "SimSun"
+            _set_run_chinese_font(run, "SimSun")
+
+        for token in _tokenize_for_vertical(col_text):
+            _emit_token(token)
+
     cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+
+# ---------------------------------------------------------------------------
+# Page and fixed-table helpers
+# ---------------------------------------------------------------------------
+
+def _setup_a4_page(doc: Document) -> None:
+    """Configure the document for A4 with tight, equal margins."""
+    section = doc.sections[0]
+    section.page_width    = Cm(A4_WIDTH_CM)
+    section.page_height   = Cm(A4_HEIGHT_CM)
+    section.top_margin    = Cm(MARGIN_TOP_CM)
+    section.bottom_margin = Cm(MARGIN_BOTTOM_CM)
+    section.left_margin   = Cm(MARGIN_LEFT_CM)
+    section.right_margin  = Cm(MARGIN_RIGHT_CM)
+
+
+def _set_table_fixed_layout(table) -> None:
+    """Force fixed column widths so Word does not auto-resize."""
+    tbl = table._tbl
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.insert(0, tblPr)
+    layout = tblPr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tblPr.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+
+def _zero_table_cell_margins(table) -> None:
+    """Set all default cell margins (top/bottom/left/right) to 0.
+
+    By default Word adds ~0.05cm of inner padding on every side of
+    every cell, which adds up across 5 rows and pushes the table to a
+    second page.  Zeroing them out keeps the whole table on one page.
+    """
+    tbl = table._tbl
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.insert(0, tblPr)
+    cell_mar = tblPr.find(qn("w:tblCellMar"))
+    if cell_mar is None:
+        cell_mar = OxmlElement("w:tblCellMar")
+        tblPr.append(cell_mar)
+    for side in ("top", "left", "bottom", "right"):
+        node = cell_mar.find(qn(f"w:{side}"))
+        if node is None:
+            node = OxmlElement(f"w:{side}")
+            cell_mar.append(node)
+        node.set(qn("w:w"),    "0")
+        node.set(qn("w:type"), "dxa")
+
+
+def _set_row_exact_height(row, height_cm: float) -> None:
+    """Force an exact row height (hRule=exact, no auto-grow)."""
+    tr = row._tr
+    trPr = tr.find(qn("w:trPr"))
+    if trPr is None:
+        trPr = OxmlElement("w:trPr")
+        tr.insert(0, trPr)
+    trH = trPr.find(qn("w:trHeight"))
+    if trH is None:
+        trH = OxmlElement("w:trHeight")
+        trPr.append(trH)
+    trH.set(qn("w:val"),   str(int(height_cm * 567)))  # 1 cm = 567 twips
+    trH.set(qn("w:hRule"), "exact")
+
+
+def _set_cell_width(cell, width_cm: float) -> None:
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcW = tcPr.find(qn("w:tcW"))
+    if tcW is None:
+        tcW = OxmlElement("w:tcW")
+        tcPr.append(tcW)
+    tcW.set(qn("w:w"),    str(int(width_cm * 567)))
+    tcW.set(qn("w:type"), "dxa")
+
+
+def _create_fixed_table(doc: Document):
+    """Create the canonical TABLE_ROWS x TABLE_COLS table."""
+    table = doc.add_table(rows=TABLE_ROWS, cols=TABLE_COLS)
+    table.style = "Table Grid"
+    _set_table_fixed_layout(table)
+    _zero_table_cell_margins(table)
+    for r_idx in range(TABLE_ROWS):
+        _set_row_exact_height(table.rows[r_idx], CELL_H_CM)
+        for c_idx in range(TABLE_COLS):
+            _set_cell_width(table.cell(r_idx, c_idx), CELL_W_CM)
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -455,28 +765,38 @@ def render_table(
                 else:
                     cell_text[w_row][col] = text
 
-        # 5. Render the Word table.
-        word_table = doc.add_table(rows=word_rows, cols=word_cols)
-        word_table.style = "Table Grid"
-        for r_idx in range(word_rows):
-            for c_idx in range(word_cols):
+        # 5. Render into the canonical fixed TABLE_ROWS x TABLE_COLS
+        #    table.  Source data is right-aligned to mirror the original
+        #    document layout: the rightmost column always holds the
+        #    generation label, and person columns extend leftward from
+        #    there.  Cells beyond the source data are left empty.
+        word_table = _create_fixed_table(doc)
+        right_col_offset = TABLE_COLS - word_cols  # may be negative
+        for r_idx in range(TABLE_ROWS):
+            for c_idx in range(TABLE_COLS):
+                txt = ""
+                bold_flag = False
+                src_c = c_idx - right_col_offset
+                if 0 <= r_idx < word_rows and 0 <= src_c < word_cols:
+                    txt = cell_text[r_idx][src_c]
+                    bold_flag = (src_c == header_col)
                 set_cell_text(
                     word_table.cell(r_idx, c_idx),
-                    cell_text[r_idx][c_idx],
-                    bold=(c_idx == header_col),
+                    txt,
+                    bold=bold_flag,
                 )
-        doc.add_paragraph("")
         return True
 
-    # ---- Fallback: generic grid rendering -------------------------------
-    word_table = doc.add_table(rows=rows, cols=cols)
-    word_table.style = "Table Grid"
-    for r_idx in range(rows):
-        for c_idx in range(cols):
-            indices = bucket[r_idx][c_idx] if c_idx < len(bucket[r_idx]) else []
-            lines = split_into_vertical_lines(indices, t_boxes, t_texts)
-            set_cell_text(word_table.cell(r_idx, c_idx), "\n".join(lines))
-    doc.add_paragraph("")
+    # ---- Fallback: generic grid rendered into the fixed 5x24 table -----
+    word_table = _create_fixed_table(doc)
+    for r_idx in range(TABLE_ROWS):
+        for c_idx in range(TABLE_COLS):
+            txt = ""
+            if r_idx < rows and c_idx < cols:
+                indices = bucket[r_idx][c_idx] if c_idx < len(bucket[r_idx]) else []
+                lines = split_into_vertical_lines(indices, t_boxes, t_texts)
+                txt = "\n".join(lines)
+            set_cell_text(word_table.cell(r_idx, c_idx), txt)
     return True
 
 
@@ -487,7 +807,25 @@ def render_table(
 def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
     """Build a Word document from the parsed JSON results."""
     doc = Document()
-    doc.add_heading("PP-StructureV3 Recovered Document", level=1)
+    _setup_a4_page(doc)
+
+    # Shrink the document's Normal style so the implicit paragraph that
+    # follows the table contributes the smallest possible vertical space.
+    # Without this, Word's default 11pt + 1.15 line spacing + 8pt space
+    # after can push the page total just past A4, forcing a 2nd page.
+    try:
+        normal = doc.styles["Normal"]
+        normal.font.size = Pt(1)
+        normal.paragraph_format.space_before = Pt(0)
+        normal.paragraph_format.space_after  = Pt(0)
+        normal.paragraph_format.line_spacing = 1.0
+    except KeyError:
+        pass
+
+    # Strip the default empty paragraph python-docx inserts so the table
+    # sits at the very top of the page.
+    for p in list(doc.paragraphs):
+        p._element.getparent().remove(p._element)
 
     table_index = 0
     for page_idx, page in enumerate(parsing_results):
@@ -534,19 +872,10 @@ def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
 
                 if not render_table(doc, cell_box_list, t_texts, t_boxes):
                     doc.add_paragraph(block.get("block_content", ""))
-            elif label in ("text", "title", "paragraph_title", "doc_title"):
-                content = block.get("block_content", "").strip()
-                if content:
-                    if label.endswith("title"):
-                        doc.add_heading(content, level=2)
-                    else:
-                        doc.add_paragraph(content)
-            elif label == "image":
-                continue
+            # Non-table blocks are intentionally skipped: the user only
+            # wants the genealogy table on the page.
             else:
-                content = block.get("block_content", "").strip()
-                if content:
-                    doc.add_paragraph(content)
+                continue
 
         if page_idx < len(parsing_results) - 1:
             doc.add_page_break()
