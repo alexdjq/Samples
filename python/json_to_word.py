@@ -25,6 +25,7 @@ try:
     from docx import Document
     from docx.shared import Pt, Cm
     from docx.enum.table import WD_ALIGN_VERTICAL
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 except ImportError:
@@ -381,7 +382,8 @@ def _tokenize_for_vertical(text: str) -> List[str]:
 
 def set_cell_text(cell, text: str, bold: bool = False,
                   cell_w_cm: float = CELL_W_CM,
-                  cell_h_cm: float = CELL_H_CM) -> None:
+                  cell_h_cm: float = CELL_H_CM,
+                  center: bool = False) -> None:
     """Render ``text`` inside a Word cell as upright vertical text.
 
     Layout rules (matching the reference document):
@@ -422,6 +424,8 @@ def set_cell_text(cell, text: str, bold: bool = False,
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after  = Pt(0)
         p.paragraph_format.line_spacing = 1.0
+        if center:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(token)
         # ASCII-only tokens (e.g. years like 1990 or ranges like
         # (1949-1995)) are rendered horizontally inside ONE paragraph.
@@ -430,8 +434,15 @@ def set_cell_text(cell, text: str, bold: bool = False,
         # where year digits are noticeably smaller than the
         # surrounding Chinese characters.
         if token and all(ord(c) < 128 for c in token):
-            ascii_size = font_size * min(1.0, 1.0 / (0.55 * len(token)))
-            ascii_size = max(ascii_size, FONT_SIZE_MIN_PT * 0.7)
+            # Year tokens like ``1990`` and range tokens like
+            # ``(1949-1995)`` are rendered horizontally on a single
+            # line.  We previously shrank them aggressively (~45 % of
+            # the base size for a 4-digit year) which made them hard
+            # to read.  Use a gentler shrink so that, e.g., ``1990``
+            # ends up at ~89 % of the surrounding Chinese characters
+            # while still fitting inside the single-glyph cell width.
+            ascii_size = font_size * min(1.0, 1.0 / (0.28 * len(token)))
+            ascii_size = max(ascii_size, FONT_SIZE_MIN_PT)
             run.font.size = Pt(ascii_size)
         else:
             run.font.size = Pt(font_size)
@@ -447,6 +458,8 @@ def set_cell_text(cell, text: str, bold: bool = False,
             p.paragraph_format.space_before = Pt(0)
             p.paragraph_format.space_after  = Pt(0)
             p.paragraph_format.line_spacing = 1.0
+            if center:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = p.add_run("")
             run.font.size = Pt(font_size)
             run.font.name = "SimSun"
@@ -455,7 +468,13 @@ def set_cell_text(cell, text: str, bold: bool = False,
         for token in _tokenize_for_vertical(col_text):
             _emit_token(token)
 
-    cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    # When ``center`` is requested, vertically center the whole
+    # paragraph stack inside the tall cell (used by the rightmost
+    # generation-label column to make 十六世/十七世 sit in the
+    # middle of their cell, matching the original document).
+    cell.vertical_alignment = (
+        WD_ALIGN_VERTICAL.CENTER if center else WD_ALIGN_VERTICAL.TOP
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +557,75 @@ def _set_cell_width(cell, width_cm: float) -> None:
     tcW.set(qn("w:type"), "dxa")
 
 
+def _set_cell_borders(cell,
+                      top: str = "single", bottom: str = "single",
+                      left: str = "nil",   right: str = "nil",
+                      sz: str = "4") -> None:
+    """Set per-cell borders.
+
+    Each side accepts a Word border-style token, e.g. ``"single"`` for a
+    visible line or ``"nil"`` to hide that side.  ``sz`` is the line
+    weight in eighths of a point (4 == 0.5pt, the Word default).
+    """
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcBorders = tcPr.find(qn("w:tcBorders"))
+    if tcBorders is None:
+        tcBorders = OxmlElement("w:tcBorders")
+        tcPr.append(tcBorders)
+    for side, val in (("top", top), ("left", left),
+                      ("bottom", bottom), ("right", right)):
+        node = tcBorders.find(qn(f"w:{side}"))
+        if node is None:
+            node = OxmlElement(f"w:{side}")
+            tcBorders.append(node)
+        node.set(qn("w:val"),   val)
+        node.set(qn("w:sz"),    sz)
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), "000000")
+
+
+def _apply_table_border_style(table, header_col: int) -> None:
+    """Apply the borders of the original document.
+
+    Visible lines are kept only on:
+      * the four outer edges of the whole table;
+      * the horizontal lines between rows (= top/bottom of every cell);
+      * the single vertical line that separates the rightmost
+        generation-label column from the person columns to its left
+        (i.e. the left edge of every cell in column ``header_col``).
+
+    All other internal vertical lines are hidden so the person columns
+    flow together as a single field of text, matching the reference
+    document.
+    """
+    n_rows = len(table.rows)
+    n_cols = len(table.columns)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cell = table.cell(r, c)
+            top    = "single"  # all horizontal lines visible
+            bottom = "single"
+            # By default, hide internal vertical lines.
+            left   = "nil"
+            right  = "nil"
+            # Outer left / right edges of the table stay visible.
+            if c == 0:
+                left = "single"
+            if c == n_cols - 1:
+                right = "single"
+            # The single internal vertical separator: between the
+            # generation-label column and the person column to its
+            # left.
+            if 0 <= header_col < n_cols:
+                if c == header_col:
+                    left = "single"
+                if c == header_col - 1:
+                    right = "single"
+            _set_cell_borders(cell, top=top, bottom=bottom,
+                              left=left, right=right)
+
+
 def _create_fixed_table(doc: Document):
     """Create the canonical TABLE_ROWS x TABLE_COLS table."""
     table = doc.add_table(rows=TABLE_ROWS, cols=TABLE_COLS)
@@ -548,6 +636,8 @@ def _create_fixed_table(doc: Document):
         _set_row_exact_height(table.rows[r_idx], CELL_H_CM)
         for c_idx in range(TABLE_COLS):
             _set_cell_width(table.cell(r_idx, c_idx), CELL_W_CM)
+    # Default: rightmost column is the generation-label column.
+    _apply_table_border_style(table, header_col=TABLE_COLS - 1)
     return table
 
 
@@ -784,6 +874,7 @@ def render_table(
                     word_table.cell(r_idx, c_idx),
                     txt,
                     bold=bold_flag,
+                    center=(c_idx == TABLE_COLS - 1),
                 )
         return True
 
