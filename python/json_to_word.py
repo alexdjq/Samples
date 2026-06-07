@@ -439,9 +439,9 @@ def set_cell_text(cell, text: str, bold: bool = False,
             # line.  We previously shrank them aggressively (~45 % of
             # the base size for a 4-digit year) which made them hard
             # to read.  Use a gentler shrink so that, e.g., ``1990``
-            # ends up at ~89 % of the surrounding Chinese characters
+            # ends up at ~69 % of the surrounding Chinese characters
             # while still fitting inside the single-glyph cell width.
-            ascii_size = font_size * min(1.0, 1.0 / (0.28 * len(token)))
+            ascii_size = font_size * min(1.0, 1.0 / (0.36 * len(token)))
             ascii_size = max(ascii_size, FONT_SIZE_MIN_PT)
             run.font.size = Pt(ascii_size)
         else:
@@ -599,6 +599,34 @@ def _apply_table_border_style(table, header_col: int) -> None:
     flow together as a single field of text, matching the reference
     document.
     """
+    # ------------------------------------------------------------------
+    # Table-level borders: explicitly hide *insideV* so Word never falls
+    # back to its default light grid for "undefined" vertical lines.
+    # We keep *insideH* visible because every row separator should
+    # remain solid, and the four outer edges are also drawn here as a
+    # safety net (per-cell borders below still fully control rendering).
+    # ------------------------------------------------------------------
+    tbl = table._tbl
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.insert(0, tblPr)
+    tblBorders = tblPr.find(qn("w:tblBorders"))
+    if tblBorders is None:
+        tblBorders = OxmlElement("w:tblBorders")
+        tblPr.append(tblBorders)
+    for side, val in (("top", "single"), ("left", "single"),
+                      ("bottom", "single"), ("right", "single"),
+                      ("insideH", "single"), ("insideV", "nil")):
+        node = tblBorders.find(qn(f"w:{side}"))
+        if node is None:
+            node = OxmlElement(f"w:{side}")
+            tblBorders.append(node)
+        node.set(qn("w:val"),   val)
+        node.set(qn("w:sz"),    "4")
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), "000000")
+
     n_rows = len(table.rows)
     n_cols = len(table.columns)
     for r in range(n_rows):
