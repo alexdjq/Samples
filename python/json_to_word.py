@@ -822,47 +822,102 @@ def _is_cn_page_number(text: str) -> bool:
     return any(ch in _CN_PAGE_REQUIRED_CHARS for ch in t)
 
 
-def _extract_title_and_page(
-    parsing_results: List[Dict[str, Any]]
+def _extract_title_and_page_for_page(
+    page: Dict[str, Any]
 ) -> Tuple[str, str]:
-    """Extract "渑池" / "杜氏宗谱" title fragments and the page number.
+    """Extract "渑池" / "杜氏宗谱" title fragments and the page number
+    for **one** page only.
 
-    Both of these live OUTSIDE the table's cell grid (they belong to the
-    page header / footer of the original PDF), so they are NOT included
-    in the per-cell OCR fragments we use to fill the table.  We therefore
-    pull them out of ``overall_ocr_res.rec_texts`` directly and return:
+    These three pieces of text live on the page edge of the source PDF
+    (vertical strip on the right hand side of the genealogy table) and
+    are NOT part of the table cell grid, so they would otherwise be
+    dropped.  We pull them out of this page's ``overall_ocr_res.rec_texts``
+    so that every page renders its own page number ("三〇六", "三〇七",
+    "三〇八", "三〇九" ...), instead of all pages sharing the first one
+    found in the document.
 
-        (title_text, page_text)
-
-    where ``title_text`` is the non-empty join of the title fragments
-    separated by ``\n`` (so the caller can render each as its own
-    person-column), and ``page_text`` is the page number string (or an
-    empty string if not found).
+    Returns ``(title_text, page_text)`` where ``title_text`` is the
+    non-empty title fragments joined by ``\n`` (so the caller can render
+    each as its own person-column inside the merged side strip cell)
+    and ``page_text`` is the page number string (or an empty string if
+    not detected on this page).
     """
+    pruned = page.get("prunedResult", page)
+    overall = pruned.get("overall_ocr_res", {})
+
     title_parts: List[str] = []
     page_text = ""
     seen: set = set()
-    for page in parsing_results:
-        pruned = page.get("prunedResult", page)
-        overall = pruned.get("overall_ocr_res", {})
-        for txt in overall.get("rec_texts", []):
-            if not txt:
-                continue
-            t = txt.strip()
-            if not t or t in seen:
-                continue
-            # Title fragments — match the originals ("渑池", "杜氏宗谱").
-            if t in ("渑池", "杜氏宗谱"):
-                title_parts.append(t)
-                seen.add(t)
-                continue
-            # Page number: prefer the first CN-digit-only fragment found.
-            if not page_text and _is_cn_page_number(t):
-                page_text = t
-                seen.add(t)
+    for txt in overall.get("rec_texts", []):
+        if not txt:
+            continue
+        t = txt.strip()
+        if not t or t in seen:
+            continue
+        # Title fragments — match the originals ("渑池", "杜氏宗谱").
+        if t in ("渑池", "杜氏宗谱"):
+            title_parts.append(t)
+            seen.add(t)
+            continue
+        # Page number: take the first CN-digit-only fragment found on
+        # this page.  Skip strings that merely contain "渑池" mid-word
+        # (e.g. "保玲1980年生适渑池") - those are not page numbers.
+        if not page_text and _is_cn_page_number(t):
+            page_text = t
+            seen.add(t)
     # Preserve the natural "渑池" before "杜氏宗谱" order if both were found.
     title_parts.sort(key=lambda s: 0 if s == "渑池" else 1)
     return "\n".join(title_parts), page_text
+
+
+def _filter_main_table_cells(cell_box_list: List[Box]) -> List[Box]:
+    """Drop OCR cells that belong to the page-edge side strip rather
+    than the genealogy table itself.
+
+    Some pages (e.g. the first sheet of 样章.pdf) have their right-
+    hand "渑池 / 杜氏宗谱 / 三〇六" vertical strip mis-detected as part
+    of the table; that injects a few abnormally tall narrow cells that
+    span almost the full page height (height >> the regular row height).
+    Those cells:
+
+      * break the row clustering inside :func:`build_grid_from_cells`
+        because their Y center lies in the middle of multiple rows;
+      * are NOT part of the 5-row genealogy grid and therefore must
+        not be rendered as table content.
+
+    We identify them by looking at the **median row height** of the
+    grid.  Any cell whose height is significantly larger (≥ 2× the
+    median) is treated as a page-edge artefact and removed.  Cells
+    that lie horizontally outside the X-range of the regular rows are
+    also dropped.
+    """
+    if not cell_box_list:
+        return []
+
+    heights = sorted(b[3] - b[1] for b in cell_box_list)
+    median_h = heights[len(heights) // 2]
+    if median_h <= 0:
+        return list(cell_box_list)
+
+    # Page-edge strip cells are dramatically taller than a normal row.
+    kept = [b for b in cell_box_list if (b[3] - b[1]) < median_h * 2.0]
+    if len(kept) < 2:
+        # Filtering would erase too much - keep the original list and
+        # let the downstream renderer try its best.
+        return list(cell_box_list)
+
+    # If after filtering we have a clean 5-row x 2-col layout (i.e. an
+    # even count divisible by 5 with the narrow + wide column pair we
+    # expect), drop any remaining outliers that sit outside the X
+    # range covered by the bulk of the cells (page-edge strip cells
+    # that happened to have the same height).
+    xs = sorted([b[0] for b in kept] + [b[2] for b in kept])
+    x_lo = xs[len(xs) // 20] if len(xs) >= 20 else xs[0]
+    x_hi = xs[-len(xs) // 20 - 1] if len(xs) >= 20 else xs[-1]
+    bulk = [b for b in kept if b[0] >= x_lo - 5 and b[2] <= x_hi + 5]
+    if len(bulk) >= 2:
+        return bulk
+    return kept
 
 
 def render_table(
@@ -1144,16 +1199,17 @@ def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
     for p in list(doc.paragraphs):
         p._element.getparent().remove(p._element)
 
-    # Pull "渑池 / 杜氏宗谱" and the page number out of the global OCR
-    # results once.  These belong to the page edge in the source PDF
-    # and live outside the table's cell grid, so they would otherwise
-    # be dropped.
-    title_text, page_text = _extract_title_and_page(parsing_results)
+    # Title / page number are extracted **per page** below so that each
+    # rendered page carries its own page number ("三〇六", "三〇七", ...)
+    # rather than reusing the first one detected in the document.
 
     for page_idx, page in enumerate(parsing_results):
         pruned = page.get("prunedResult", page)
         parsing_list = pruned.get("parsing_res_list", [])
         table_res_list = pruned.get("table_res_list", [])
+
+        # Title / page number for THIS page only.
+        title_text, page_text = _extract_title_and_page_for_page(page)
 
         # ``table_res_list`` is *per-page*, so the cursor that walks
         # through it must also be per-page.  Resetting it inside the
@@ -1181,6 +1237,12 @@ def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
                 table_index += 1
 
                 cell_box_list = [tuple(b) for b in tres.get("cell_box_list", [])]
+                # Some pages include OCR cells from the right-hand
+                # page-edge strip ("渑池 / 杜氏宗谱 / page number") in
+                # the table cell list.  Those cells span the full page
+                # height and confuse the row clustering, so strip them
+                # out before building the grid.
+                cell_box_list = _filter_main_table_cells(cell_box_list)
 
                 # Filter overall OCR boxes to those overlapping this table
                 # region (defined by the union of its cell boxes).
