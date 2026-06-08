@@ -1150,11 +1150,18 @@ def build_docx(parsing_results: List[Dict[str, Any]], output_path: str) -> None:
     # be dropped.
     title_text, page_text = _extract_title_and_page(parsing_results)
 
-    table_index = 0
     for page_idx, page in enumerate(parsing_results):
         pruned = page.get("prunedResult", page)
         parsing_list = pruned.get("parsing_res_list", [])
         table_res_list = pruned.get("table_res_list", [])
+
+        # ``table_res_list`` is *per-page*, so the cursor that walks
+        # through it must also be per-page.  Resetting it inside the
+        # loop ensures the table on page 2/3/4 is rendered just like
+        # the one on page 1, instead of falling back to the raw HTML
+        # branch (which Word renders as a faint dotted grid with no
+        # text -- the very symptom the user reported).
+        table_index = 0
 
         # ``overall_ocr_res`` uses the same global image coordinates as
         # ``cell_box_list``; ``table_ocr_pred`` may use a different (often
@@ -1232,8 +1239,19 @@ def main(argv: List[str]) -> int:
     with open(input_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if not isinstance(data, list):
-        data = [data]
+    # PP-StructureV3 has two output shapes:
+    #   * legacy: a JSON list, where each element corresponds to one
+    #     parsed page and already exposes ``prunedResult`` directly.
+    #   * new   : a JSON object with a top-level ``layoutParsingResults``
+    #     array; each element wraps the page in
+    #     ``{"prunedResult": ..., "markdown": ..., ...}``.
+    # Normalise both shapes to a list of page dicts so the rest of
+    # the pipeline does not need to care.
+    if isinstance(data, dict):
+        if "layoutParsingResults" in data:
+            data = data["layoutParsingResults"]
+        else:
+            data = [data]
 
     build_docx(data, output_path)
     print(f"Word document generated: {output_path}")
