@@ -720,6 +720,10 @@ def _apply_table_border_style(table, header_col: int,
        and the merged title column) from the body of person columns.
     3. Horizontal separators between successive 世代 rows so each
        generation reads as its own band.
+    4. A vertical line on the LEFT side of ``merged_col`` (when
+       provided), which separates the right-edge title column
+       ("渑池/杜氏宗谱/page-number") from the generation-label column
+       to its left -- matching the original PDF layout.
 
     All other inside-vertical lines (between adjacent person columns)
     are suppressed -- those are precisely the lines that turned the
@@ -831,16 +835,32 @@ def _apply_table_border_style(table, header_col: int,
                               right=_read_cell_border(cell, "right"))
 
     # ------------------------------------------------------------------
+    # Step 3b: vertical separator on the LEFT side of ``merged_col``.
+    # This draws the line between the generation-label column ("X世")
+    # and the right-edge title column ("渑池/杜氏宗谱/page-number"),
+    # matching the original PDF's layout.  Skip when merged_col <= 0
+    # (would coincide with the outer left edge already drawn) or
+    # >= n_cols (out of range), or when it equals header_col (line
+    # already drawn in Step 3).
+    # ------------------------------------------------------------------
+    if 0 < merged_col < n_cols and merged_col != header_col:
+        for r in range(n_rows):
+            cell = table.cell(r, merged_col)
+            _set_cell_borders(cell,
+                              top=_read_cell_border(cell, "top"),
+                              bottom=_read_cell_border(cell, "bottom"),
+                              left="single",
+                              right=_read_cell_border(cell, "right"))
+
+    # ------------------------------------------------------------------
     # Step 4: horizontal lines between successive generation rows.
     # We draw them as the BOTTOM border of every row except the last
     # (whose bottom is already covered by the outer rectangle).  We
     # deliberately draw across **every** column, including the merged
     # title column on the far right -- the original PDF shows the
     # row separator running edge-to-edge, cutting through the title
-    # band as well.  ``merged_col`` is currently unused but kept in
-    # the signature for forward compatibility.
+    # band as well.
     # ------------------------------------------------------------------
-    _ = merged_col  # noqa: F841 -- accepted but intentionally unused.
     for r in range(n_rows - 1):
         for c in range(n_cols):
             cell = table.cell(r, c)
@@ -1149,9 +1169,59 @@ def _filter_main_table_cells(cell_box_list: List[Box]) -> List[Box]:
             continue
         pruned.append(b)
 
-    if len(pruned) >= 2:
-        return pruned
-    return bulk
+    final = pruned if len(pruned) >= 2 else bulk
+
+    # ------------------------------------------------------------------
+    # Synthesize missing narrow header cells.
+    #
+    # On some pages (e.g. page 14 of 窑湾.pdf) the OCR engine merges the
+    # narrow "X世" header cell of one row with the page-edge strip into
+    # a single tall super-cell, which then gets dropped above as a
+    # row-spanning artefact.  The result is a row that contains only
+    # its wide content cell -- which makes
+    # :func:`render_table` see an inconsistent column structure and
+    # fall back to the generic 5x2 layout, mangling the output.
+    #
+    # To recover, we detect the typical narrow-cell X range and add a
+    # synthetic header cell for every wide content cell that has no
+    # matching narrow cell (i.e. no narrow cell vertically overlaps
+    # its row band).  The synthetic cell carries the typical narrow X
+    # range and inherits its Y range from the corresponding wide cell.
+    # ------------------------------------------------------------------
+    if final:
+        widths = sorted(b[2] - b[0] for b in final)
+        med_w = widths[len(widths) // 2]
+        narrow = [b for b in final if (b[2] - b[0]) < med_w * 0.5]
+        wide = [b for b in final if (b[2] - b[0]) >= med_w * 0.5]
+        if narrow and wide and len(wide) > len(narrow):
+            # Compute the typical narrow X range as the median of
+            # existing narrow cells -- much more robust than mean
+            # against the occasional jittery cell.
+            n_x1 = sorted(b[0] for b in narrow)
+            n_x2 = sorted(b[2] for b in narrow)
+            typ_x1 = n_x1[len(n_x1) // 2]
+            typ_x2 = n_x2[len(n_x2) // 2]
+
+            def _overlaps_vert(a: Box, b: Box, tol: float = 5.0) -> bool:
+                return not (a[3] <= b[1] + tol or a[1] >= b[3] - tol)
+
+            synthetic: List[Box] = []
+            for w in wide:
+                has_partner = any(_overlaps_vert(w, n) for n in narrow)
+                if has_partner:
+                    continue
+                # Build a synthetic narrow cell: typical X range, the
+                # wide cell's Y range.  Preserve any extra trailing
+                # fields (e.g. confidence score) that the OCR put on
+                # the wide cell, so downstream code that inspects the
+                # tuple length stays happy.
+                synth: Box = (typ_x1, w[1], typ_x2, w[3]) + tuple(w[4:])
+                synthetic.append(synth)
+
+            if synthetic:
+                final = list(final) + synthetic
+
+    return final
 
 
 def render_table(
