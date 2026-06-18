@@ -600,6 +600,86 @@ def _set_cell_width(cell, width_cm: float) -> None:
     tcW.set(qn("w:type"), "dxa")
 
 
+def _collapse_empty_columns(table, min_visible_cm: float = 0.05) -> None:
+    """Shrink every column whose every cell is empty to ``min_visible_cm``.
+
+    Why this matters: under the global X-anchor strategy used in
+    :func:`render_table`, dense rows (e.g. 十世 with 12 persons) and
+    sparse rows (e.g. 九世 with 6 persons) share the same column grid.
+    The result is large stretches of completely-empty columns between
+    sparse-row entries, which read as a "huge gap" to the user.
+
+    By detecting columns where *every* row is blank and physically
+    shrinking them to a near-zero width, we keep the cross-row anchor
+    alignment intact (the order and relative position of person
+    columns is preserved) while removing the visual dead-space.  The
+    width freed by collapsing those columns is redistributed evenly
+    across the columns that actually carry content, so the table still
+    fills the full :data:`_USABLE_W_CM`.
+
+    Parameters
+    ----------
+    table : docx.table.Table
+        The table to compact.  Must be built with a fixed layout
+        (`_set_table_fixed_layout`) for the new widths to take effect.
+    min_visible_cm : float, optional
+        Width to assign to each empty column.  Defaults to 0.05 cm,
+        small enough to be invisible but non-zero so Word does not
+        drop the column entirely.
+    """
+    n_rows = len(table.rows)
+    n_cols = len(table.columns)
+    if n_rows == 0 or n_cols == 0:
+        return
+
+    # 1) Detect empty columns.
+    empty_flags: List[bool] = []
+    for c in range(n_cols):
+        is_empty = True
+        for r in range(n_rows):
+            if table.cell(r, c).text.strip():
+                is_empty = False
+                break
+        empty_flags.append(is_empty)
+
+    n_empty = sum(empty_flags)
+    if n_empty == 0 or n_empty == n_cols:
+        # Nothing to compact (no empties, or every column empty).
+        return
+
+    n_filled = n_cols - n_empty
+    width_for_empty = min_visible_cm
+    width_for_filled = (
+        _USABLE_W_CM - width_for_empty * n_empty
+    ) / n_filled
+    # Defensive lower bound: never let filled columns shrink below the
+    # empty-column width.
+    if width_for_filled < min_visible_cm:
+        width_for_filled = min_visible_cm
+
+    # 2) Update every cell's tcW so Word renders the new widths.
+    for r in range(n_rows):
+        for c in range(n_cols):
+            new_w = width_for_empty if empty_flags[c] else width_for_filled
+            _set_cell_width(table.cell(r, c), new_w)
+
+    # 3) Update <w:tblGrid> too.  Under fixed-layout tables Word also
+    #    consults the table grid; keeping it in sync with tcW prevents
+    #    some renderers from falling back to equal column widths.
+    tbl = table._tbl
+    tblGrid = tbl.find(qn("w:tblGrid"))
+    if tblGrid is not None:
+        # Remove existing gridCol entries, then re-create them so the
+        # count always matches ``n_cols`` exactly.
+        for gc in list(tblGrid.findall(qn("w:gridCol"))):
+            tblGrid.remove(gc)
+        for c in range(n_cols):
+            new_w = width_for_empty if empty_flags[c] else width_for_filled
+            gc = OxmlElement("w:gridCol")
+            gc.set(qn("w:w"), str(int(new_w * 567)))
+            tblGrid.append(gc)
+
+
 def _set_cell_borders(cell,
                       top: str = "single", bottom: str = "single",
                       left: str = "nil",   right: str = "nil",
@@ -628,27 +708,59 @@ def _set_cell_borders(cell,
         node.set(qn("w:color"), "000000")
 
 
-def _apply_table_border_style(table, header_col: int) -> None:
-    """Apply the borders of the original document.
+def _apply_table_border_style(table, header_col: int,
+                              merged_col: int = -1) -> None:
+    """Apply a "key-borders-only" style typical of Chinese genealogies.
 
-    Visible lines are kept only on:
-      * the four outer edges of the whole table;
-      * the horizontal lines between rows (= top/bottom of every cell);
-      * the single vertical line that separates the rightmost
-        generation-label column from the person columns to its left
-        (i.e. the left edge of every cell in column ``header_col``).
+    The original PDF for this project shows three structural lines:
 
-    All other internal vertical lines are hidden so the person columns
-    flow together as a single field of text, matching the reference
-    document.
+    1. The full outer rectangle around the whole table.
+    2. A vertical line on the LEFT side of ``header_col``, which
+       separates the right-hand "page-edge band" (generation labels
+       and the merged title column) from the body of person columns.
+    3. Horizontal separators between successive 世代 rows so each
+       generation reads as its own band.
+
+    All other inside-vertical lines (between adjacent person columns)
+    are suppressed -- those are precisely the lines that turned the
+    earlier output into an unwanted grid.
+
+    Parameters
+    ----------
+    table : docx.table.Table
+        Table to style.
+    header_col : int
+        Index of the column whose **left** side gets a vertical
+        separator drawn.  Pass a negative value or 0 to skip drawing
+        the separator (when there is no header band at all).
+    merged_col : int, optional
+        Index of a vertically-merged column (e.g. the right-edge
+        title column ``"渑池/杜氏宗谱/page-number"``).  Horizontal
+        separators between rows are *not* drawn over this column so
+        the merged cell reads as one continuous vertical band, just
+        like in the PDF.  Pass ``-1`` (default) when no column is
+        merged.
     """
+    n_rows = len(table.rows)
+    n_cols = len(table.columns)
+    if n_rows == 0 or n_cols == 0:
+        return
+
     # ------------------------------------------------------------------
-    # Table-level borders: explicitly hide *insideV* so Word never falls
-    # back to its default light grid for "undefined" vertical lines.
-    # We keep *insideH* visible because every row separator should
-    # remain solid, and the four outer edges are also drawn here as a
-    # safety net (per-cell borders below still fully control rendering).
+    # Step 1: hide every cell border, then re-enable only the ones we
+    # actually want.  Working at the cell level (rather than the
+    # table-level <w:tblBorders>) gives us per-cell control which is
+    # required for the "title column separator" and "between-row
+    # horizontal lines" rules.
     # ------------------------------------------------------------------
+    for r in range(n_rows):
+        for c in range(n_cols):
+            _set_cell_borders(table.cell(r, c),
+                              top="nil", bottom="nil",
+                              left="nil", right="nil")
+
+    # Suppress the table-level inside borders too, otherwise some Word
+    # versions still draw the implicit "Table Grid" lines.
     tbl = table._tbl
     tblPr = tbl.find(qn("w:tblPr"))
     if tblPr is None:
@@ -658,64 +770,130 @@ def _apply_table_border_style(table, header_col: int) -> None:
     if tblBorders is None:
         tblBorders = OxmlElement("w:tblBorders")
         tblPr.append(tblBorders)
-    for side, val in (("top", "single"), ("left", "single"),
-                      ("bottom", "single"), ("right", "single"),
-                      ("insideH", "single"), ("insideV", "nil")):
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
         node = tblBorders.find(qn(f"w:{side}"))
         if node is None:
             node = OxmlElement(f"w:{side}")
             tblBorders.append(node)
-        node.set(qn("w:val"),   val)
-        node.set(qn("w:sz"),    "4")
+        node.set(qn("w:val"),   "nil")
+        node.set(qn("w:sz"),    "0")
         node.set(qn("w:space"), "0")
-        node.set(qn("w:color"), "000000")
+        node.set(qn("w:color"), "auto")
 
-    n_rows = len(table.rows)
-    n_cols = len(table.columns)
+    # ------------------------------------------------------------------
+    # Step 2: draw the outer rectangle.
+    # ------------------------------------------------------------------
+    last_row = n_rows - 1
+    last_col = n_cols - 1
+    for c in range(n_cols):
+        # Top edge
+        top_cell = table.cell(0, c)
+        _set_cell_borders(top_cell,
+                          top="single",
+                          bottom=_read_cell_border(top_cell, "bottom"),
+                          left=_read_cell_border(top_cell, "left"),
+                          right=_read_cell_border(top_cell, "right"))
+        # Bottom edge
+        bot_cell = table.cell(last_row, c)
+        _set_cell_borders(bot_cell,
+                          top=_read_cell_border(bot_cell, "top"),
+                          bottom="single",
+                          left=_read_cell_border(bot_cell, "left"),
+                          right=_read_cell_border(bot_cell, "right"))
     for r in range(n_rows):
+        # Left edge
+        left_cell = table.cell(r, 0)
+        _set_cell_borders(left_cell,
+                          top=_read_cell_border(left_cell, "top"),
+                          bottom=_read_cell_border(left_cell, "bottom"),
+                          left="single",
+                          right=_read_cell_border(left_cell, "right"))
+        # Right edge
+        right_cell = table.cell(r, last_col)
+        _set_cell_borders(right_cell,
+                          top=_read_cell_border(right_cell, "top"),
+                          bottom=_read_cell_border(right_cell, "bottom"),
+                          left=_read_cell_border(right_cell, "left"),
+                          right="single")
+
+    # ------------------------------------------------------------------
+    # Step 3: vertical separator on the LEFT side of ``header_col``.
+    # Skip when header_col <= 0 (would coincide with the outer left
+    # edge already drawn) or >= n_cols (out of range).
+    # ------------------------------------------------------------------
+    if 0 < header_col < n_cols:
+        for r in range(n_rows):
+            cell = table.cell(r, header_col)
+            _set_cell_borders(cell,
+                              top=_read_cell_border(cell, "top"),
+                              bottom=_read_cell_border(cell, "bottom"),
+                              left="single",
+                              right=_read_cell_border(cell, "right"))
+
+    # ------------------------------------------------------------------
+    # Step 4: horizontal lines between successive generation rows.
+    # We draw them as the BOTTOM border of every row except the last
+    # (whose bottom is already covered by the outer rectangle).  We
+    # deliberately draw across **every** column, including the merged
+    # title column on the far right -- the original PDF shows the
+    # row separator running edge-to-edge, cutting through the title
+    # band as well.  ``merged_col`` is currently unused but kept in
+    # the signature for forward compatibility.
+    # ------------------------------------------------------------------
+    _ = merged_col  # noqa: F841 -- accepted but intentionally unused.
+    for r in range(n_rows - 1):
         for c in range(n_cols):
             cell = table.cell(r, c)
-            top    = "single"  # all horizontal lines visible
-            bottom = "single"
-            # By default, hide internal vertical lines.
-            left   = "nil"
-            right  = "nil"
-            # Outer left / right edges of the table stay visible.
-            if c == 0:
-                left = "single"
-            if c == n_cols - 1:
-                right = "single"
-            # Internal vertical separators we want to keep:
-            #   1. Between the generation-label column and the person
-            #      column to its left (left edge of ``header_col``).
-            #   2. Between the generation-label column and the
-            #      rightmost book-title/page column to its right
-            #      (right edge of ``header_col``).
-            # All other internal vertical lines stay hidden.
-            if 0 <= header_col < n_cols:
-                if c == header_col:
-                    left = "single"
-                    right = "single"
-                if c == header_col - 1:
-                    right = "single"
-                if c == header_col + 1:
-                    left = "single"
-            _set_cell_borders(cell, top=top, bottom=bottom,
-                              left=left, right=right)
+            _set_cell_borders(cell,
+                              top=_read_cell_border(cell, "top"),
+                              bottom="single",
+                              left=_read_cell_border(cell, "left"),
+                              right=_read_cell_border(cell, "right"))
 
 
-def _create_fixed_table(doc: Document):
-    """Create the canonical TABLE_ROWS x TABLE_COLS table."""
-    table = doc.add_table(rows=TABLE_ROWS, cols=TABLE_COLS)
-    table.style = "Table Grid"
+def _read_cell_border(cell, side: str) -> str:
+    """Return the current border value of ``side`` ('nil' if unset)."""
+    tc = cell._tc
+    tcPr = tc.find(qn("w:tcPr"))
+    if tcPr is None:
+        return "nil"
+    tcBorders = tcPr.find(qn("w:tcBorders"))
+    if tcBorders is None:
+        return "nil"
+    node = tcBorders.find(qn(f"w:{side}"))
+    if node is None:
+        return "nil"
+    return node.get(qn("w:val")) or "nil"
+
+
+def _create_fixed_table(doc: Document, n_cols: int = TABLE_COLS):
+    """Create a TABLE_ROWS x ``n_cols`` table.
+
+    ``n_cols`` defaults to the canonical :data:`TABLE_COLS` value but
+    callers can request a wider table when a single page contains more
+    person-columns than the default 24-column layout can hold.  The
+    column width is scaled so the whole table still fits within the
+    A4 usable width (no horizontal overflow).
+    """
+    if n_cols < 1:
+        n_cols = TABLE_COLS
+    cell_w_cm = _USABLE_W_CM / n_cols
+    table = doc.add_table(rows=TABLE_ROWS, cols=n_cols)
+    # NOTE: deliberately do *not* set ``table.style = "Table Grid"``.
+    # The Grid style applies a default 0.5pt border on every side of
+    # every cell which some renderers (notably WPS / older Word
+    # versions) still draw even when ``tblBorders`` are set to ``nil``
+    # at the table level.  Using the default ("Normal Table") style and
+    # then explicitly hiding every border in :func:`_apply_table_border_style`
+    # gives the most reliable borderless rendering across viewers.
     _set_table_fixed_layout(table)
     _zero_table_cell_margins(table)
     for r_idx in range(TABLE_ROWS):
         _set_row_exact_height(table.rows[r_idx], CELL_H_CM)
-        for c_idx in range(TABLE_COLS):
-            _set_cell_width(table.cell(r_idx, c_idx), CELL_W_CM)
+        for c_idx in range(n_cols):
+            _set_cell_width(table.cell(r_idx, c_idx), cell_w_cm)
     # Default: rightmost column is the generation-label column.
-    _apply_table_border_style(table, header_col=TABLE_COLS - 1)
+    _apply_table_border_style(table, header_col=n_cols - 1)
     return table
 
 
@@ -915,9 +1093,65 @@ def _filter_main_table_cells(cell_box_list: List[Box]) -> List[Box]:
     x_lo = xs[len(xs) // 20] if len(xs) >= 20 else xs[0]
     x_hi = xs[-len(xs) // 20 - 1] if len(xs) >= 20 else xs[-1]
     bulk = [b for b in kept if b[0] >= x_lo - 5 and b[2] <= x_hi + 5]
-    if len(bulk) >= 2:
-        return bulk
-    return kept
+    if len(bulk) < 2:
+        bulk = kept
+
+    # ------------------------------------------------------------------
+    # Drop **row-spanning merged cells**.
+    #
+    # On some pages (e.g. page 2 of 窑湾.pdf) the leftmost column is
+    # detected as TWO tall cells that each vertically span 2 of the 5
+    # generation rows.  Their height (~516 / ~709) is below the
+    # ``2 * median`` threshold above, so they survive the first pass --
+    # but they still ruin the row clustering inside
+    # :func:`build_grid_from_cells`, splitting the genealogy grid into
+    # 6 pseudo-rows instead of 5.  The very last real row (e.g. 十世)
+    # is then pushed past ``TABLE_ROWS`` and silently dropped.
+    #
+    # We detect such cells by checking how much vertical overlap each
+    # cell has with the "row body" of every other cell.  Any cell that
+    # *contains* the Y center of two or more other cells is treated as
+    # a merged super-cell and removed -- its contents will instead be
+    # picked up via the global OCR text boxes when the renderer falls
+    # back to its anchor-based layout.
+    # ------------------------------------------------------------------
+    def _y_center(b: Box) -> float:
+        return (b[1] + b[3]) / 2.0
+
+    centers_y = [_y_center(b) for b in bulk]
+    pruned: List[Box] = []
+    for i, b in enumerate(bulk):
+        # A genuine *row-spanning* merged cell vertically swallows
+        # cells from MULTIPLE other rows.  We detect this by counting
+        # how many other cells have a Y center that is (a) inside this
+        # cell's vertical span, AND (b) far enough from this cell's
+        # own Y center to clearly belong to a different row -- the
+        # threshold is half the cell's own height, which separates
+        # same-row neighbours (almost identical Y centers) from cells
+        # that genuinely sit in a different generation row.
+        b_cy = _y_center(b)
+        b_h = max(1.0, b[3] - b[1])
+        spans = 0
+        for j, cy in enumerate(centers_y):
+            if j == i:
+                continue
+            if not (b[1] + 5 < cy < b[3] - 5):
+                continue
+            if abs(cy - b_cy) <= b_h * 0.25:
+                # Cell ``j`` is on the same row as ``i`` (their Y
+                # centers nearly coincide); ignore.
+                continue
+            spans += 1
+        if spans >= 2:
+            # This cell vertically swallows >=2 cells from other rows
+            # -- it is a merged super-cell, drop it so the genealogy
+            # grid keeps its clean 5-row structure.
+            continue
+        pruned.append(b)
+
+    if len(pruned) >= 2:
+        return pruned
+    return bulk
 
 
 def render_table(
@@ -1064,33 +1298,55 @@ def render_table(
                 else:
                     cell_text[w_row][col] = text
 
-        # 5. Render into the canonical fixed TABLE_ROWS x TABLE_COLS
-        #    table.
+        # 5. Render into a TABLE_ROWS x ``table_cols`` table.
         #
         #    Layout (right -> left):
-        #      * column TABLE_COLS-1 (rightmost): book title "渑池 / 杜氏
+        #      * column table_cols-1 (rightmost): book title "渑池 / 杜氏
         #        宗谱" on the first row + page number "三〇八" on the
         #        last row, mirroring the page-edge column of the
         #        original document.
-        #      * column TABLE_COLS-2 : generation labels (十六世 ...).
-        #      * columns 0 .. TABLE_COLS-3 : person columns, right-
+        #      * column table_cols-2 : generation labels (十六世 ...).
+        #      * columns 0 .. table_cols-3 : person columns, right-
         #        aligned to the generation column.
         #    When the title column is not requested (no extracted text),
         #    we fall back to the previous behaviour where the generation
         #    label sits in the rightmost column.
-        word_table = _create_fixed_table(doc)
-
+        #
+        #    ``table_cols`` is normally the canonical ``TABLE_COLS``
+        #    (24) but is automatically widened when the current page
+        #    has so many distinct person-columns that the leftmost
+        #    one(s) would otherwise be cropped off the table.  This
+        #    keeps every OCR fragment visible in its correct image-
+        #    relative position even when the OCR detected an unusually
+        #    high number of vertical text columns on the page.
         has_title_col = bool(title_text or page_text)
-        title_col_idx = TABLE_COLS - 1 if has_title_col else -1
+        # Required column count = N person columns + 1 generation
+        # label column + (1 title column if any).
+        required_cols = word_cols + (1 if has_title_col else 0)
+        table_cols = max(TABLE_COLS, required_cols)
+
+        word_table = _create_fixed_table(doc, n_cols=table_cols)
+
+        title_col_idx = table_cols - 1 if has_title_col else -1
         # Anchor for the generation-label column.
-        gen_label_col = TABLE_COLS - 2 if has_title_col else TABLE_COLS - 1
+        gen_label_col = table_cols - 2 if has_title_col else table_cols - 1
         # Person columns occupy [0 .. gen_label_col-1]; right-align.
         right_col_offset = gen_label_col - (word_cols - 1)
 
+        # Per-cell width depends on the (possibly widened) table.
+        cell_w_cm_local = _USABLE_W_CM / table_cols
+
         # Re-apply borders to match the new header column position so
         # the only internal vertical line stays adjacent to the
-        # generation-label column.
-        _apply_table_border_style(word_table, header_col=gen_label_col)
+        # generation-label column.  ``merged_col`` is the rightmost
+        # title column (when present) which is vertically merged
+        # across all rows; it must be excluded from the per-row
+        # horizontal separators.
+        _apply_table_border_style(
+            word_table,
+            header_col=gen_label_col,
+            merged_col=title_col_idx,
+        )
 
         # If the title column is enabled, vertically merge all 5 rows
         # of the rightmost column into a single tall cell.  The merged
@@ -1104,7 +1360,7 @@ def render_table(
                 top_cell.merge(word_table.cell(r_idx, title_col_idx))
 
         for r_idx in range(TABLE_ROWS):
-            for c_idx in range(TABLE_COLS):
+            for c_idx in range(table_cols):
                 if c_idx == title_col_idx:
                     # The merged title/page cell is filled exactly
                     # once below; skip the per-row iteration here.
@@ -1126,6 +1382,7 @@ def render_table(
                     txt,
                     bold=bold_flag,
                     center=center_flag,
+                    cell_w_cm=cell_w_cm_local,
                 )
 
         # Fill the merged title/page cell once, vertically centered
@@ -1156,6 +1413,7 @@ def render_table(
                 merged_text,
                 bold=True,
                 center=True,
+                cell_w_cm=cell_w_cm_local,
             )
         return True
 
