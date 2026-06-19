@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -1020,6 +1021,102 @@ def _is_cn_page_number(text: str) -> bool:
     return any(ch in _CN_PAGE_REQUIRED_CHARS for ch in t)
 
 
+# ---------------------------------------------------------------------------
+# Page-label helpers -- derive a Chinese-numeral page label from the
+# trailing integer in the input filename (e.g. "Default folder - 30.json"
+# -> "三十") and inject it into a page's OCR text list so the downstream
+# spine-column renderer picks it up.
+# ---------------------------------------------------------------------------
+
+_CN_DIGITS = "零一二三四五六七八九"
+_CN_UNITS_SMALL = ["", "十", "百", "千"]
+_CN_UNITS_BIG   = ["", "万", "亿"]
+
+
+def _int_to_chinese_numeral(n: int) -> str:
+    """Convert a non-negative integer to its standard Chinese numeral
+    form (e.g. 3 -> "三", 11 -> "十一", 30 -> "三十", 234 -> "二百三十四")."""
+    if n < 0:
+        raise ValueError("page number must be non-negative")
+    if n == 0:
+        return _CN_DIGITS[0]
+    if n < 10:
+        return _CN_DIGITS[n]
+    if n < 20:
+        # 10 -> "十", 11 -> "十一", ..., 19 -> "十九"
+        return "十" + ("" if n == 10 else _CN_DIGITS[n - 10])
+
+    groups: List[int] = []
+    rem = n
+    while rem > 0:
+        groups.append(rem % 10000)
+        rem //= 10000
+
+    parts: List[str] = []
+    for idx in range(len(groups) - 1, -1, -1):
+        g = groups[idx]
+        if g == 0:
+            if parts and not parts[-1].endswith(_CN_DIGITS[0]):
+                parts.append(_CN_DIGITS[0])
+            continue
+        digits = [(g // 1000) % 10, (g // 100) % 10, (g // 10) % 10, g % 10]
+        chunk: List[str] = []
+        zero_pending = False
+        for pos, d in enumerate(digits):
+            unit = _CN_UNITS_SMALL[3 - pos]
+            if d == 0:
+                zero_pending = True
+            else:
+                if zero_pending and chunk:
+                    chunk.append(_CN_DIGITS[0])
+                chunk.append(_CN_DIGITS[d] + unit)
+                zero_pending = False
+        parts.append("".join(chunk) + _CN_UNITS_BIG[idx])
+
+    result = "".join(parts)
+    while "零零" in result:
+        result = result.replace("零零", "零")
+    if result.endswith("零"):
+        result = result[:-1]
+    return result
+
+
+def _page_label_from_filename(input_path: str) -> Optional[str]:
+    """Pull the trailing integer out of ``input_path`` and convert it to
+    a Chinese numeral suitable for use as a page label.  Returns
+    ``None`` when no trailing number can be found.
+    """
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    m = re.search(r"(\d+)\s*$", stem)
+    if not m:
+        return None
+    try:
+        return _int_to_chinese_numeral(int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def _inject_page_label(page: Dict[str, Any], label: str) -> None:
+    """Override the spine column page label for this page.
+
+    The label is stored on a dedicated side-channel key
+    (``_page_label_override``) at both the page level and the
+    ``prunedResult`` level so that :func:`_extract_title_and_page_for_page`
+    can pick it up without us having to mutate ``rec_texts`` /
+    ``rec_boxes`` -- those two arrays are index-aligned and
+    consumed elsewhere as the OCR text/geometry source of truth, so
+    inserting an extra entry into ``rec_texts`` would shift every
+    subsequent text out of sync with its bounding box and corrupt
+    the rendered table.
+    """
+    if not isinstance(page, dict):
+        return
+    page["_page_label_override"] = label
+    pruned = page.get("prunedResult")
+    if isinstance(pruned, dict):
+        pruned["_page_label_override"] = label
+
+
 def _extract_title_and_page_for_page(
     page: Dict[str, Any]
 ) -> Tuple[str, str]:
@@ -1065,6 +1162,14 @@ def _extract_title_and_page_for_page(
             seen.add(t)
     # Preserve the natural "渑池" before "杜氏宗谱" order if both were found.
     title_parts.sort(key=lambda s: 0 if s == "渑池" else 1)
+
+    # Filename-derived override always wins over OCR's guess so the
+    # rendered page number matches the trailing integer in the input
+    # filename (e.g. "... - 30.json" -> "三十" instead of OCR's "三〇").
+    override = page.get("_page_label_override") or pruned.get("_page_label_override")
+    if isinstance(override, str) and override:
+        page_text = override
+
     return "\n".join(title_parts), page_text
 
 
@@ -1642,6 +1747,19 @@ def main(argv: List[str]) -> int:
             data = data["layoutParsingResults"]
         else:
             data = [data]
+
+    # ------------------------------------------------------------------
+    # Page-number override.  The trailing integer in the input filename
+    # (e.g. "Default folder - 30.json" -> 30) is the authoritative page
+    # number.  Convert it to the standard Chinese numeral form ("三十")
+    # and inject it into every page's OCR text list so the downstream
+    # extractor renders that label in the right-hand spine column,
+    # regardless of what (if anything) OCR detected on the page edge.
+    # ------------------------------------------------------------------
+    fn_label = _page_label_from_filename(input_path)
+    if fn_label:
+        for page in data:
+            _inject_page_label(page, fn_label)
 
     build_docx(data, output_path)
     print(f"Word document generated: {output_path}")
